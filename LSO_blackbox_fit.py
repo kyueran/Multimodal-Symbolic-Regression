@@ -3,7 +3,6 @@ import torch
 import numpy as np
 import datetime
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler,TensorDataset
-import torch
 from itertools import cycle
 from tqdm import tqdm
 import argparse
@@ -24,6 +23,7 @@ import warnings
 import random
 import nevergrad as ng
 from scipy.optimize import differential_evolution
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score  
 
 import traceback
 
@@ -55,12 +55,10 @@ def reload_model(modules, path, requires_grad=False):
     return modules
 
 
-def gen2eq(env, params, encoded_y, generations, sample_to_learn, stored_skeletons ):
+def gen2eq(env, params, encoded_y, generations, sample_to_learn, stored_skeletons):
     dimension = sample_to_learn['x_to_fit'][0].shape[1]
     x_gt = sample_to_learn['x_to_fit'][0].reshape(-1,dimension) 
     y_gt = sample_to_learn['y_to_fit'][0].reshape(-1,1) 
-    x_gt_pred = sample_to_learn['x_to_predict'][0].reshape(-1,dimension) 
-    y_gt_pred = sample_to_learn['y_to_predict'][0].reshape(-1,1) 
     generations = generations.unsqueeze(-1)
     generations = generations.transpose(1, 2).cpu().tolist()
     generations_tree = [
@@ -70,45 +68,20 @@ def gen2eq(env, params, encoded_y, generations, sample_to_learn, stored_skeleton
                 ],))for i in range(len(encoded_y))]
     ### 
     non_skeleton_tree = copy.deepcopy(generations_tree)
-    #rint("GENERATIONS_TREE", generations_tree)
-    #print("NON_SKELETON_TREE", non_skeleton_tree)
     skeleton_candidate, _ = env.generator.function_to_skeleton(non_skeleton_tree[0][0], constants_with_idx=False)
     if skeleton_candidate.infix() in stored_skeletons:
-        return False, skeleton_candidate , None, None, None, None, None, None, None, None 
+        return False, skeleton_candidate, None, None
     else:
         refined = refine(env, x_gt, y_gt, non_skeleton_tree[0], verbose=True)
         best_tree = list(filter(lambda gen: gen["refinement_type"]=='BFGS', refined))
         tree = best_tree[0]['predicted_tree'] #non_skeleton_tree[i][0] #
-        numexpr_fn = env.simplifier.tree_to_numexpr_fn(tree)
+
+        numexpr_fn = env.simplifier.tree_to_numexpr_fn(tree) 
+
         y = numexpr_fn(x_gt)[:,0].reshape(-1,1)
-        y_pred = numexpr_fn(x_gt_pred)[:,0].reshape(-1,1)
-
-        if np.isnan(y).any():
-            mse_fit = float('inf')
-        else:
-            mse_fit = np.mean((y-y_gt)**2) / ( np.mean(y_gt**2) + 1e-10)
-            mse_pred = np.mean((y_pred - y_gt_pred)**2) / ( np.mean(y_gt**2) + 1e-10)
-
-        complexity = len(tree.prefix().split(','))
-
-        results_fit = compute_metrics(
-            {
-                "true": [y_gt],
-                "predicted": [y],
-                # "tree": [tree_gt],
-                "predicted_tree": [tree],
-            },
-            metrics=params.validation_metrics,
-        )
-        results_predict = compute_metrics(
-            {
-                "true": [y_gt_pred],
-                "predicted": [y_pred],
-                "predicted_tree": [tree],
-            },
-            metrics=params.validation_metrics,
-        )
-        eq_outputs = (True, skeleton_candidate, tree, complexity, y, y_pred , mse_fit, mse_pred, results_fit, results_predict)
+        r2_zero = max(r2_score(y_gt, y), 0)
+       
+        eq_outputs = (True, skeleton_candidate, tree, r2_zero)
         return eq_outputs
 
 
@@ -155,7 +128,6 @@ def create_population(env,params,model, sample_to_learn, encoded_y):
 
 
 def lso_fit(sample_to_learn, env, params, model,batch_results,bag_number):
-
     sub_sample = copy.deepcopy(sample_to_learn)
 
     seq_len = len(sample_to_learn['x_to_fit'][0])
@@ -181,42 +153,13 @@ def lso_fit(sample_to_learn, env, params, model,batch_results,bag_number):
     
     outputs = model(sub_sample,max_len = params.max_target_len)
     encoded_y, generations, gen_len = outputs
-    stored_skeletons = []
-    try:
-        #print("DIRECT gen2eq")
-        eq_outputs = gen2eq(env, params, encoded_y, generations, sample_to_learn, stored_skeletons)
-        success , skeleton_candidate, tree, complexity, y, y_pred ,mse_fit, mse_pred, results_fit, results_predict = eq_outputs
-        if success == True:
-            stored_skeletons.append(skeleton_candidate.infix())
-            max_r2 = results_fit['r2_zero'][0]
-            # batch_results["gt_tree"].extend([tree_gt])
-            batch_results["direct_predicted_tree"].extend([tree])
-            batch_results["complexity_gt_tree"].extend([complexity])
-            batch_results["direct_fit_mse"].extend([mse_fit])
-            batch_results["direct_pred_mse"].extend([mse_pred])
-            for k, v in results_fit.items():
-                batch_results[k + "_direct_fit"].extend(v)
-            del results_fit
-            for k, v in results_predict.items():
-                batch_results[k + "_direct_predict"].extend(v)
-            del results_predict            
-    except:
-        tree = 'NaN'
-        complexity = 'NaN'
-        mse_fit = float('inf')
-        mse_pred = 'NaN'
-        max_r2 = 0
-        y= 'NaN'
-        y_pred = 'NaN'
+    #logger.info("encoded_y: %s", encoded_y)
+    #logger.info("generations: %s", generations)
 
-    min_mse = mse_fit
-    max_r2 = max_r2
-    best_eq = tree
-    best_y = y
-    best_y_pred = y_pred
+    max_r2 = 0
+    best_eq = None
 
     start_time = time.time()
-
     encoded_pop = create_population(env, params, model, sample_to_learn, encoded_y)
     pop = encoded_pop
 
@@ -229,51 +172,40 @@ def lso_fit(sample_to_learn, env, params, model,batch_results,bag_number):
     Alpha_score, Beta_score, Delta_score = np.inf, np.inf, np.inf
 
     count_repeated = 0
+
+    stored_skeletons = []
     for t in range(max_iteration):
         r2_pop = np.zeros(len(encoded_pop))
-        mse_pop = np.zeros(len(encoded_pop))
         start_time_fwd = time.time()
         generations_pop = model.generate_from_latent_sampling(pop)
-        print("forward pass with b=2, pop=50 : ", time.time() - start_time_fwd)
+        print("forward pass with b=2, pop=50 : ", time.time() - start_time_fwd )
         for i in range(len(pop)):
             highest_r2_in_beam = 0
-            mse_in_beam = float('inf') 
             best_eq_in_beam = 'NaN'
-            best_y_in_beam = 'NaN'
-            best_y_pred_in_beam = 'NaN'
             for b in range(params.beam_size):
                 try:
-                    #print(f"POPULATION {i}, BEAM {b}")
-                    #print(f"ENCODED_Y {pop[i].reshape(1,-1)}, GENERATIONS, {generations_pop[params.beam_size*i+b].reshape(1,-1)}")
                     eq_outputs = gen2eq(env, params, pop[i].reshape(1,-1), generations_pop[params.beam_size*i+b].reshape(1,-1), sample_to_learn , stored_skeletons)
-                    success , skeleton_candidate, tree, complexity, y, y_pred, mse_fit, mse_pred, results_fit, results_predict = eq_outputs
-                    #print(f"END OF POPULATION {i}, BEAM {b}, SUCCESS {success}, SKELETON_CANDIDATE {skeleton_candidate}")
+                    success, skeleton_candidate, tree, r2_zero = eq_outputs
                     if success == True:
                         stored_skeletons.append(skeleton_candidate.infix())
-                        if results_fit['r2_zero'][0] >= highest_r2_in_beam:
-                            highest_r2_in_beam = results_fit['r2_zero'][0] 
-                            mse_in_beam = mse_fit
+                        if r2_zero >= highest_r2_in_beam:
+                            highest_r2_in_beam = r2_zero
                             best_eq_in_beam = tree
-                            best_y_in_beam = y 
-                            best_y_pred_in_beam = y_pred 
                     if success == False:
                         count_repeated += 1
                         # print(f"Repeated Skeleton {count_repeated}")
-                except Exception as e:
-                    #print(f"ERROR AT END OF POPULATION {i}, BEAM {b}, ERROR {e}")
-                    traceback.format_exc()
-                    #print("========================================================")
 
-
-            r2_pop[i] = highest_r2_in_beam
-            mse_pop[i] = mse_in_beam
+                except:
+                    pass
             
+            r2_pop[i] = highest_r2_in_beam
+
             if highest_r2_in_beam > max_r2:
                 max_r2 = highest_r2_in_beam
-                min_mse = mse_in_beam
                 best_eq = best_eq_in_beam
-                best_y = best_y_in_beam
-                best_y_pred = best_y_pred_in_beam
+            if highest_r2_in_beam > params.lso_stop_r2:
+                print(f"Finish at population: {i}")
+                break
 
         pop_list.append(pop.cpu().numpy())
         r2_pop_list.append(r2_pop)
@@ -292,100 +224,51 @@ def lso_fit(sample_to_learn, env, params, model,batch_results,bag_number):
         Alpha_score, Beta_score, Delta_score , Alpha_pos, Beta_pos, Delta_pos = elites
 
         print(f"Max R2 of sample at iteration {t} is {max_r2}")
-        ### Calculate R2 fit on whole training set 
-        dimension = sample_to_learn['x_to_fit'][0].shape[1]
-        x_gt = sample_to_learn['x_to_fit'][0].reshape(-1,dimension) 
-        y_gt = sample_to_learn['y_to_fit'][0].reshape(-1,1) 
-        x_gt_pred = sample_to_learn['x_to_predict'][0].reshape(-1,dimension) 
-        y_gt_pred = sample_to_learn['y_to_predict'][0].reshape(-1,1) 
 
-        try:
-            numexpr_fn = env.simplifier.tree_to_numexpr_fn(best_eq) 
-            y = numexpr_fn(x_gt)[:,0].reshape(-1,1)
-            results_fit = compute_metrics(
-                {
-                    "true": [y_gt],
-                    "predicted": [y],
-                    # "tree": [tree_gt],
-                    "predicted_tree": [best_eq],
-                },
-                metrics=params.validation_metrics,
-            )
-            if results_fit['r2_zero'][0] > params.lso_stop_r2:
-                print("finish at iteration: ", t)
-                break
-        except:
-            pass
+        if highest_r2_in_beam > params.lso_stop_r2:
+            print(f"Finish at iteration: {t}")
+            break
 
-    optimization_duration = time.time()- start_time
-    batch_results["final_predicted_tree"].extend([best_eq])
-    batch_results["final_fit_mse"].extend([min_mse])
+    
+    optimization_duration = time.time() - start_time
 
     ###
     dimension = sample_to_learn['x_to_fit'][0].shape[1]
-    x_gt = sample_to_learn['x_to_fit'][0].reshape(-1,dimension) 
-    y_gt = sample_to_learn['y_to_fit'][0].reshape(-1,1) 
     x_gt_pred = sample_to_learn['x_to_predict'][0].reshape(-1,dimension) 
     y_gt_pred = sample_to_learn['y_to_predict'][0].reshape(-1,1) 
 
-    
     try:
         numexpr_fn = env.simplifier.tree_to_numexpr_fn(best_eq) 
-
-        y = numexpr_fn(x_gt)[:,0].reshape(-1,1)
         y_pred = numexpr_fn(x_gt_pred)[:,0].reshape(-1,1)
-        if np.isnan(y).any():
-            mse_fit = float('inf')
-        else:
-            mse_fit = np.mean((y-y_gt)**2) / ( np.mean(y_gt**2) + 1e-10)
-            mse_pred = np.mean((y_pred - y_gt_pred)**2) / ( np.mean(y_gt**2) + 1e-10)
-
         complexity = len(best_eq.prefix().split(','))
 
-        results_fit = compute_metrics(
-            {
-                "true": [y_gt],
-                "predicted": [y],
-                # "tree": [tree_gt],
-                "predicted_tree": [best_eq],
-            },
-            metrics=params.validation_metrics,
-        )
+        batch_results["mse_test"].extend([mean_squared_error(y_gt_pred, y_pred)])
+        batch_results["mae_test"].extend([mean_absolute_error(y_gt_pred, y_pred)])
+        batch_results["r2_test"].extend([r2_score(y_gt_pred, y_pred)])
+        batch_results["r2_zero_test"].extend([max(batch_results["r2_test"][0], 0)])
 
-        results_predict = compute_metrics(
-            {
-                "true": [y_gt_pred],
-                "predicted": [y_pred],
-                # "tree": [tree_gt],
-                "predicted_tree": [best_eq],
-            },
-            metrics=params.validation_metrics,
-        )
-        #### 
-        for k, v in results_fit.items():
-            batch_results[k + "_final_fit"].extend(v)
-        del results_fit
+        batch_results["symbolic_model"].extend([best_eq])
+        batch_results["model_size"].extend([complexity])
+        batch_results["training time (s)"].extend([optimization_duration])
+        batch_results["training time (hr)"].extend([optimization_duration / 3600])
 
-        for k, v in results_predict.items():
-            batch_results[k + "_final_predict"].extend(v)
-        del results_predict
-
-        batch_results["time"].extend([optimization_duration])
-    except:
-        pass
+    except Exception as e:
+        # Log the exception message and type
+        print(f"An error occurred: {e}")
 
     return batch_results
     
 
 
 class LSOFitNeverGrad():
-    def __init__(self, env, params, model, sample_to_learn, batch_results, bag_number):
+    def __init__(self, env, params, model, sample_to_learn, batch_results, bag_number, logger):
         self.env = env
         self.params = params
         self.model = model
         self.sample_to_learn = sample_to_learn
         self.batch_results = batch_results
         self.bag_number = bag_number
+        self.logger = logger
 
         self.max_r2 = 0
         self.min_mse = 'NaN'
@@ -420,7 +303,7 @@ class LSOFitNeverGrad():
         outputs = self.model(sub_sample,max_len = self.params.max_target_len)
         encoded_y, generations, gen_len = outputs
         try: 
-            eq_outputs = self.gen2eq(encoded_y, generations)
+            eq_outputs = self.gen2eq(encoded_y, generations, self.logger)
             skeleton_candidate, tree, complexity, y, y_pred ,mse_fit, mse_pred, results_fit, results_predict = eq_outputs
             max_r2 = results_fit['r2_zero'][0]
             self.batch_results["direct_predicted_tree"].extend([tree])
@@ -477,7 +360,6 @@ class LSOFitNeverGrad():
         ### RandomSearch
         if self.params.lso_optimizer == "randomsearch":
             optimizer = ng.optimizers.RandomSearch(parametrization=instrum, budget=100, num_workers=1)
-
 
         ### initial evaluation
         r2_pop = self.evaluate_pop(pop)
@@ -557,6 +439,8 @@ class LSOFitNeverGrad():
         generations_pop = self.model.generate_from_latent_sampling(pop)
         mse_pop = np.zeros(len(pop))
         r2_pop = np.zeros(len(pop))
+        cand_r2 = np.zeros(len(pop))
+
         for i in range(len(pop)):
             highest_r2_in_beam = 0
             mse_in_beam = float('inf') 
@@ -565,8 +449,10 @@ class LSOFitNeverGrad():
             best_y_pred_in_beam = 'NaN'
             for b in range(self.params.beam_size):
                 try:
-                    eq_outputs = self.gen2eq(pop[i].reshape(1,-1), generations_pop[self.params.beam_size*i+b].reshape(1,-1))
+                    eq_outputs = self.gen2eq(pop[i].reshape(1,-1), generations_pop[self.params.beam_size*i+b].reshape(1,-1), self.logger)
                     skeleton_candidate, tree, complexity, y, y_pred, mse_fit, mse_pred, results_fit, results_predict = eq_outputs
+                    cand_r2[i] = results_fit['r2_zero'][0]
+
                     if results_fit['r2_zero'][0] >= highest_r2_in_beam:
                         highest_r2_in_beam = results_fit['r2_zero'][0] 
                         mse_in_beam = mse_fit
@@ -574,6 +460,7 @@ class LSOFitNeverGrad():
                         best_y_in_beam = y 
                         best_y_pred_in_beam = y_pred 
                 except:
+                    #traceback.print_exc()
                     pass
 
             r2_pop[i] = highest_r2_in_beam
@@ -586,6 +473,7 @@ class LSOFitNeverGrad():
                 self.best_y = best_y_in_beam
                 self.best_y_pred = best_y_pred_in_beam
 
+        self.logger.info(f"cand_r2: {cand_r2}, min: {np.min(cand_r2)}, max: {np.max(cand_r2)}")
         return -r2_pop
 
     def evaluate_agent(self, agent):
@@ -602,7 +490,7 @@ class LSOFitNeverGrad():
             best_y_pred_in_beam = 'NaN'
             for b in range(self.params.beam_size):
                 try:
-                    eq_outputs = self.gen2eq(pop[i].reshape(1,-1), generations_pop[self.params.beam_size*i+b].reshape(1,-1))
+                    eq_outputs = self.gen2eq(pop[i].reshape(1,-1), generations_pop[self.params.beam_size*i+b].reshape(1,-1), self.logger)
                     skeleton_candidate, tree, complexity, y, y_pred, mse_fit, mse_pred, results_fit, results_predict = eq_outputs
                     if results_fit['r2_zero'][0] >= highest_r2_in_beam:
                         highest_r2_in_beam = results_fit['r2_zero'][0] 
@@ -625,7 +513,7 @@ class LSOFitNeverGrad():
 
         return -r2_pop
 
-    def gen2eq(self, encoded_y, generations):
+    def gen2eq(self, encoded_y, generations, logger):
         dimension = self.sample_to_learn['x_to_fit'][0].shape[1]
         x_gt = self.sample_to_learn['x_to_fit'][0].reshape(-1,dimension) 
         y_gt = self.sample_to_learn['y_to_fit'][0].reshape(-1,1) 
@@ -640,12 +528,14 @@ class LSOFitNeverGrad():
                     ],))for i in range(len(encoded_y))]
         ### 
         non_skeleton_tree = copy.deepcopy(generations_tree)
+        print(non_skeleton_tree[0][0])
 
         skeleton_candidate, _ = self.env.generator.function_to_skeleton(non_skeleton_tree[0][0], constants_with_idx=False)
-        refined = refine(self.env, x_gt, y_gt, non_skeleton_tree[0], verbose=True)
+        refined = refine(self.env, x_gt, y_gt, non_skeleton_tree[0], logger=logger, verbose=True)
         best_tree = list(filter(lambda gen: gen["refinement_type"]=='BFGS', refined))
         tree = best_tree[0]['predicted_tree'] #non_skeleton_tree[i][0] #
 
+        
         numexpr_fn = self.env.simplifier.tree_to_numexpr_fn(tree) 
         y = numexpr_fn(x_gt)[:,0].reshape(-1,1)
         y_pred = numexpr_fn(x_gt_pred)[:,0].reshape(-1,1)
@@ -724,3 +614,253 @@ class LSOFitNeverGrad():
             encoded_pop = torch.cat((encoded_pop, encoded_aug), dim=0)
 
         return encoded_pop
+
+import logging
+
+# Suppress INFO logs from ax.service.ax_client
+logging.getLogger("ax").setLevel(logging.WARNING)
+
+from typing import Optional
+
+from botorch.models.gpytorch import GPyTorchModel
+from gpytorch.distributions import MultivariateNormal
+from gpytorch.kernels import RBFKernel, ScaleKernel
+from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.means import ConstantMean
+from gpytorch.models import ExactGP
+from torch import Tensor
+
+from ax.models.torch.botorch_modular.model import BoTorchModel
+from ax.models.torch.botorch_modular.surrogate import Surrogate
+
+from ax.modelbridge.generation_strategy import GenerationStep, GenerationStrategy
+from ax.modelbridge.registry import Models
+
+from ax.service.ax_client import AxClient
+from ax.service.utils.instantiation import ObjectiveProperties
+
+import botorch
+botorch.settings.debug(True)
+
+class LSOFitBoTorch(LSOFitNeverGrad):
+    def fit_func(self):
+        class SimpleCustomGP(ExactGP, GPyTorchModel):
+            _num_outputs = 1  # to inform GPyTorchModel API
+
+            def __init__(self, train_X, train_Y, train_Yvar: Optional[Tensor] = None):
+                # NOTE: This ignores train_Yvar and uses inferred noise instead.
+                # squeeze output dim before passing train_Y to ExactGP
+                super().__init__(train_X, train_Y.squeeze(-1), GaussianLikelihood())
+                self.mean_module = ConstantMean()
+                self.covar_module = ScaleKernel(
+                    base_kernel=RBFKernel(ard_num_dims=train_X.shape[-1]),
+                )
+
+                self.to(train_X)  # make sure we're on the right device/dtype
+
+            def forward(self, x):
+                mean_x = self.mean_module(x)
+                covar_x = self.covar_module(x)
+                return MultivariateNormal(mean_x, covar_x)
+        
+        random.seed(9)
+        sub_sample = copy.deepcopy(self.sample_to_learn)
+        seq_len = len(self.sample_to_learn['x_to_fit'][0])
+        all_indices = list(range(seq_len))
+        if seq_len >= self.params.max_input_points:
+            random_indices = random.sample(all_indices, self.params.max_input_points)
+            sub_sample['X_scaled_to_fit'][0] = np.array([self.sample_to_learn['X_scaled_to_fit'][0][i] for i in random_indices])
+            sub_sample['Y_scaled_to_fit'][0] = np.array([self.sample_to_learn['Y_scaled_to_fit'][0][i] for i in random_indices])
+            sub_sample['x_to_fit'][0] = np.array([self.sample_to_learn['x_to_fit'][0][i] for i in random_indices])
+            sub_sample['y_to_fit'][0] = np.array([self.sample_to_learn['y_to_fit'][0][i] for i in random_indices])
+
+            seq_len = len(self.sample_to_learn['x_to_predict'][0])
+            all_indices = list(range(seq_len))
+            if seq_len >= self.params.max_input_points:
+                random_indices = random.sample(all_indices, self.params.max_input_points)
+                sub_sample['x_to_predict'][0] = np.array([self.sample_to_learn['x_to_predict'][0][i] for i in random_indices])
+                sub_sample['y_to_predict'][0] = np.array([self.sample_to_learn['y_to_predict'][0][i] for i in random_indices])
+            else:
+                sub_sample['x_to_predict'][0] = self.sample_to_learn['x_to_predict'][0]
+                sub_sample['y_to_predict'][0] = self.sample_to_learn['y_to_predict'][0]
+        else:
+            sub_sample = self.sample_to_learn
+
+        outputs = self.model(sub_sample, max_len=self.params.max_target_len)
+        encoded_y, generations, gen_len = outputs
+        #self.logger.info("encoded_y: %s", encoded_y)
+        #self.logger.info("generations: %s", generations)
+        try:
+            eq_outputs = self.gen2eq(encoded_y, generations, self.logger)
+            skeleton_candidate, tree, complexity, y, y_pred, mse_fit, mse_pred, results_fit, results_predict = eq_outputs
+            #self.logger.info("BO Direct Tree: %s", tree)
+            max_r2 = results_fit['r2_zero'][0]
+            self.batch_results["direct_predicted_tree"].extend([tree])
+            self.batch_results["complexity_gt_tree"].extend([complexity])
+            self.batch_results["direct_fit_mse"].extend([mse_fit])
+            self.batch_results["direct_pred_mse"].extend([mse_pred])
+            for k, v in results_fit.items():
+                self.batch_results[k + "_direct_fit"].extend(v)
+            del results_fit
+            for k, v in results_predict.items():
+                self.batch_results[k + "_direct_predict"].extend(v)
+            del results_predict
+        except:
+            tree = 'NaN'
+            complexity = 'NaN'
+            mse_fit = float('inf')
+            mse_pred = 'NaN'
+            max_r2 = 0
+            y = 'NaN'
+            y_pred = 'NaN'
+
+        self.min_mse = mse_fit
+        self.max_r2 = max_r2
+        self.best_eq = tree
+        self.best_y = y
+        self.best_y_pred = y_pred
+
+        start_time = time.time()
+
+        encoded_pop = self.create_population(encoded_y)
+        pop = encoded_pop.detach().cpu().numpy()
+
+        r2_pop = self.evaluate_pop(pop)
+        fitness = r2_pop
+
+        ax_model = BoTorchModel(
+            surrogate=Surrogate(
+                # The model class to use
+                botorch_model_class=SimpleCustomGP,
+                # Optional, MLL class with which to optimize model parameters
+                # mll_class=ExactMarginalLogLikelihood,
+                # Optional, dictionary of keyword arguments to model constructor
+                # model_options={}
+            ),
+            # Optional, acquisition function class to use - see custom acquisition tutorial
+            # botorch_acqf_class=qExpectedImprovement,
+        )
+
+        gs = GenerationStrategy(
+            steps=[
+                # Quasi-random initialization step
+                GenerationStep(
+                    model=Models.SOBOL,
+                    num_trials=100,  # How many trials should be produced from this generation step
+                ),
+                # Bayesian optimization step using the custom acquisition function
+                GenerationStep(
+                    model=Models.BOTORCH_MODULAR,
+                    num_trials=-1,  # No limitation on how many trials should be produced from this step
+                    # For `BOTORCH_MODULAR`, we pass in kwargs to specify what surrogate or acquisition function to use.
+                    model_kwargs={
+                        "surrogate": Surrogate(SimpleCustomGP),
+                    },
+                ),
+            ]
+        )
+
+        ax_client = AxClient(generation_strategy=gs)
+        # Setup the experiment
+        ax_client.create_experiment(
+            name="optimal_equation_experiment",
+            parameters = [
+                {
+                    "name": f"param_{i}",
+                    "type": "range",
+                    #"bounds": [float(-1.5), float(1.5)],
+                    "bounds": [float(np.min(pop[:, i])), float(np.max(pop[:, i]))],
+                }
+                for i in range(pop.shape[1])  # Loop over each column in the pop matrix
+            ],
+            objectives={
+                "neg_r2": ObjectiveProperties(minimize=True),
+            },
+        )
+        # Setup a function to evaluate the trials
+        neg_r2 = self.evaluate_agent
+
+
+        def evaluate(parameters):
+            # Extract all 512 parameters
+            agent = torch.tensor([[parameters.get(f"param_{i}") for i in range(pop.shape[1])]], dtype=torch.float32)
+
+            negative_r2_score = self.evaluate_agent(agent)
+            
+            # Return the result as a dictionary with the objective name
+            return {"neg_r2": (negative_r2_score.item(), float("nan"))}
+        
+        with torch.enable_grad():
+            NUM_EVALS = 2000
+            for i in range(NUM_EVALS):
+                try:
+                    parameters, trial_index = ax_client.get_next_trial()
+                    raw_data = evaluate(parameters)
+                    if raw_data["neg_r2"][0] < -self.params.lso_stop_r2:
+                        self.logger.info(f"Stopping early as neg_r2 is less than -0.99: {raw_data['neg_r2'][0]}")
+                        ax_client.complete_trial(trial_index=trial_index, raw_data=raw_data)
+                        break
+                    ax_client.complete_trial(trial_index=trial_index, raw_data=raw_data)
+                except Exception as e:
+                    self.logger.error(f"An error occurred during trial {i}: {str(e)}")
+                    break
+        
+            parameters, values = ax_client.get_best_parameters()
+        #print(f"Best parameters: {parameters}")
+
+        optimization_duration = time.time() - start_time
+        self.batch_results["final_predicted_tree"].extend([self.best_eq])
+        self.batch_results["final_fit_mse"].extend([self.min_mse])
+
+        dimension = self.sample_to_learn['x_to_fit'][0].shape[1]
+        x_gt = self.sample_to_learn['x_to_fit'][0].reshape(-1,dimension) 
+        y_gt = self.sample_to_learn['y_to_fit'][0].reshape(-1,1) 
+        x_gt_pred = self.sample_to_learn['x_to_predict'][0].reshape(-1,dimension) 
+        y_gt_pred = self.sample_to_learn['y_to_predict'][0].reshape(-1,1) 
+
+        ## modified
+        try:
+            numexpr_fn = self.env.simplifier.tree_to_numexpr_fn(self.best_eq) 
+
+            y = numexpr_fn(x_gt)[:,0].reshape(-1,1)
+            y_pred = numexpr_fn(x_gt_pred)[:,0].reshape(-1,1)
+            if np.isnan(y).any():
+                mse_fit = float('inf')
+            else:
+                mse_fit = np.mean((y-y_gt)**2) / ( np.mean(y_gt**2) + 1e-10)
+                mse_pred = np.mean((y_pred - y_gt_pred)**2) / ( np.mean(y_gt**2) + 1e-10)
+
+            complexity = len(self.best_eq.prefix().split(','))
+
+            results_fit = compute_metrics(
+                {
+                    "true": [y_gt],
+                    "predicted": [y],
+                    # "tree": [tree_gt],
+                    "predicted_tree": [self.best_eq],
+                },
+                metrics=self.params.validation_metrics,
+            )
+
+            results_predict = compute_metrics(
+                {
+                    "true": [y_gt_pred],
+                    "predicted": [y_pred],
+                    # "tree": [tree_gt],
+                    "predicted_tree": [self.best_eq],
+                },
+                metrics=self.params.validation_metrics,
+            )
+            for k, v in results_fit.items():
+                self.batch_results[k + "_final_fit"].extend(v)
+            del results_fit
+
+            for k, v in results_predict.items():
+                self.batch_results[k + "_final_predict"].extend(v)
+            del results_predict
+
+            self.batch_results["time"].extend([optimization_duration])
+        except:
+            pass
+
+        return self.batch_results

@@ -1,0 +1,3 @@
+#python LSO_blackbox_eval.py --reload_model ./weights/default-periodic-8.pth --dump_path ./dump/eval/snip-512-blackbox-p2 --eval_lso_on_pmlb True --pmlb_data_type blackbox --target_noise 0.0 --max_input_points 200 --lso_optimizer gwo --lso_pop_size 50 --lso_max_iteration 20 --lso_stop_r2 0.99 --beam_size 2
+
+#python LSO_blackbox_eval.py --reload_model ./weights/snip-e2e-sr.pth --dump_path ./dump/eval/snip-e2e-blackbox-p2 --eval_lso_on_pmlb True --pmlb_data_type blackbox --target_noise 0.0 --max_input_points 200 --lso_optimizer gwo --lso_pop_size 50 --lso_max_iteration 20 --lso_stop_r2 0.99 --beam_size 2

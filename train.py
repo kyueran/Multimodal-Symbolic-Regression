@@ -22,9 +22,11 @@ from symbolicregression.envs import build_env
 from symbolicregression.trainer import Trainer
 from parsers import get_parser
 
+from torch.utils.tensorboard import SummaryWriter
+
 np.seterr(all="raise")
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="7"
 
 
 def main(params):
@@ -52,6 +54,9 @@ def main(params):
     env = build_env(params)
 
     modules = build_modules(env, params)
+
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(log_dir=params.dump_path)
     trainer = Trainer(modules, env, params)
 
     # training
@@ -74,8 +79,8 @@ def main(params):
 
         trainer.inner_epoch = 0
         while trainer.inner_epoch < trainer.n_steps_per_epoch:
-
-            # training steps
+            print("Inner epoch:", trainer.inner_epoch, "Total steps per epoch:", trainer.n_steps_per_epoch)
+            # training steps    
             for task_id in np.random.permutation(len(params.tasks)):
                 task = params.tasks[task_id]
                 if params.export_data:
@@ -84,6 +89,7 @@ def main(params):
                     encoded_y, samples, loss = trainer.enc_dec_step(task)
                     
                 trainer.iter()
+                writer.add_scalar('Loss/train', loss.item(), trainer.n_total_iter)
 
         logger.info("============ End of epoch %i ============" % trainer.epoch)
         if params.debug_train_statistics:
@@ -91,9 +97,9 @@ def main(params):
                 trainer.get_generation_statistics(task)
 
         trainer.epoch += 1
-        if trainer.epoch % 10 == 0:
+        if trainer.epoch % params.save_periodic == 0:
             trainer.save_periodic()
-
+    writer.close()
 
 if __name__ == "__main__":
 

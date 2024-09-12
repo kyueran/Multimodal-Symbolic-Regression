@@ -5,6 +5,7 @@ import sympy as sp
 import os, sys
 import symbolicregression
 import requests
+import re
 
 from symbolicregression.envs import build_env
 from symbolicregression.model import check_model_params, build_modules
@@ -21,12 +22,19 @@ from symbolicregression.slurm import init_signal_handler, init_distributed_mode
 from sklearn.model_selection import train_test_split
 from pathlib import Path
 from model import SNIPSymbolicRegressor
-from LSO_fit import lso_fit, LSOFitNeverGrad
+from LSO_groundtruth_fit import lso_fit, LSOFitNeverGrad, LSOFitBoTorch
 
 import time
 from tqdm import tqdm
 import copy
 import random
+
+import logging
+from symbolicregression.utils import initialize_exp
+
+from yaml import load, Loader
+from sympy import Symbol, factor, Float, preorder_traversal, Integer
+from sympy.parsing.sympy_parser import parse_expr
 
 def set_seed(seed):
     random.seed(seed)
@@ -34,6 +42,20 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+def setup_logger(log_file):
+    log_dir = os.path.dirname(log_file)
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    logging.basicConfig(
+        filename=log_file,
+        filemode='a',  # Append mode
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        level=logging.INFO  # Change to DEBUG for more verbose output
+    )
 
 def reload_model(modules, path, requires_grad=False):
     """
@@ -47,6 +69,9 @@ def reload_model(modules, path, requires_grad=False):
 
     # reload model parameters
     for k, v in modules.items():
+        if k == "image_processor":
+            print(f"Skipping reloading for {k}")
+            continue
         try:
             weights = data[k]
             v.load_state_dict(weights)
@@ -88,7 +113,43 @@ def ensure_columns(df, required_columns):
             df[col] = pd.NA
     return df[required_columns]
 
+def round_floats(ex1):
+    ex2 = ex1
+
+    for a in preorder_traversal(ex1):
+        if isinstance(a, Float):
+            if abs(a) < 0.0001:
+                ex2 = ex2.subs(a,Integer(0))
+            else:
+                ex2 = ex2.subs(a, Float(round(a, 3),3))
+    return ex2
+
+def get_sym_model(dataset, return_str=True):
+    """return sympy model from dataset metadata"""
+    metadata = load(
+            open('/'.join(dataset.split('/')[:-1])+'/metadata.yaml','r'),
+            Loader=Loader
+    )
+    df = pd.read_csv(dataset,sep='\t')
+    features = [c for c in df.columns if c != 'target']
+#     print('features:',df.columns)
+    description = metadata['description'].split('\n')
+    model_str = [ms for ms in description if '=' in ms][0].split('=')[-1]
+    model_str = model_str.replace('pi','3.1415926535')
+    if return_str:
+        return model_str
+
+    # pdb.set_trace()
+    # handle feynman problem constants
+#     print('model:',model_str)
+    model_sym = parse_expr(model_str, 
+			   local_dict = {k:Symbol(k) for k in features})
+    model_sym = round_floats(model_sym)
+#     print('sym model:',model_sym)
+    return model_sym
+
 def evaluate_pmlb_lso(
+        data_type,
         trainer,
         params,
         target_noise=0.0,
@@ -99,14 +160,19 @@ def evaluate_pmlb_lso(
         logger=None,
         save_file=None,
         save_suffix="./eval_result/eval_pmlb_lso.csv",
-        rescale = True):
+        rescale = False,
+        first_write = True,
+        feature_noise = 0.0,
+        start_from_index = 0):
 
-        set_seed(9)
+        pd.set_option('display.float_format', lambda x: '%.10f' % x)
+
         env = trainer.env
         params = params
         path = params.reload_model
-        trainer.modules = reload_model(trainer.modules, path)
-        model = SNIPSymbolicRegressor(params = params, env=env, modules=trainer.modules)
+        modules = build_modules(env, params)
+        #trainer.modules = reload_model(trainer.modules, path)
+        model = SNIPSymbolicRegressor(params = params, env=env, modules=modules)
         model.to(params.device)
         batch_results = defaultdict(list)
         all_datasets = pd.read_csv(
@@ -137,25 +203,52 @@ def evaluate_pmlb_lso(
             save_file = save_suffix
         rng = np.random.RandomState(random_state)
         pbar = tqdm(total=len(problem_names))
-        first_write = True
-        counter =0 
+        counter = 0 
 
-        required_columns = ['formula', 'problem', 'input_dimension', 'r2_zero_direct_fit', 'r2_zero_final_fit', 'r2_zero_direct_predict', 'r2_zero_final_predict', '_complexity_final_predict', 'time', 'direct_pred_mse', '_complexity_direct_predict', 'direct_fit_mse', 'direct_predicted_tree', 'accuracy_l1_1e-1_final_predict', 'accuracy_l1_1e-3_final_predict', 'accuracy_l1_1e-1_direct_predict', 'complexity_gt_tree', 'accuracy_l1_1e-2_direct_predict', 'accuracy_l1_1e-2_final_fit', 'r2_direct_predict', 'bag_number', 'r2_direct_fit', 'final_predicted_tree', '_complexity_direct_fit', 'accuracy_l1_1e-3_direct_predict', 'accuracy_l1_1e-3_final_fit', 'accuracy_l1_1e-2_direct_fit', 'accuracy_l1_1e-1_final_fit', '_complexity_final_fit', 'accuracy_l1_biggio_direct_predict', 'accuracy_l1_1e-3_direct_fit', 'accuracy_l1_1e-1_direct_fit', 'accuracy_l1_biggio_final_fit', 'final_fit_mse', 'r2_final_predict', 'accuracy_l1_1e-2_final_predict', 'accuracy_l1_biggio_direct_fit', 'accuracy_l1_biggio_final_predict', 'r2_final_fit']
-
+        required_columns = ['dataset', 'algorithm', 'random_state', 'process_time', 'training time (s)', 
+                            'target_noise', 'feature_noise', 'true_model', 'model_size', 'symbolic_model', 
+                            'mse_train', 'mae_train', 'r2_train', 'mse_test', 'mae_test', 'r2_test', 
+                            'simplified_symbolic_model', 'simplified_complexity', 
+                            'symbolic_error', 'symbolic_fraction', 'symbolic_error_is_zero', 'symbolic_error_is_constant',
+                            'sympy_exception','training time (hr)', 'r2_zero_test',
+                            'data_group', 'symbolic_solution']
+        
+        print("RANDOM STATE:", random_state)
+        print("PROBLEM NAMES:", problem_names)
         for problem_name in problem_names:
-            counter += 1
+            print("heartbeat_0")
+            if counter < start_from_index:
+                counter += 1
+                first_write = False
+                continue
+
+            true_model = get_sym_model(f'./datasets/pmlb/datasets/{problem_name}/{problem_name}.tsv.gz', return_str=False)
             
-            print("Sample: ", counter)
             if problem_name in feynman_formulas:
                 formula = feynman_formulas[problem_name]
             else:
                 formula = "???"
             print("GT equation : ", formula)
             print("EQ: ", problem_name)
-
-            X, y, _ = read_file(pmlb_path + "{}/{}.tsv.gz".format(problem_name, problem_name))
+            print(pmlb_path + "{}/{}.tsv.gz".format(problem_name, problem_name))
+            X, y, feature_names = read_file(pmlb_path + "{}/{}.tsv.gz".format(problem_name, problem_name))
             y = np.expand_dims(y, -1)
+        
+            '''
+            for i in range(2):
+                problem_name = "pendulum"
+                formula = "pendulum_formula"
+                file_path = '/home/kyueran/siip/datasets/pendulum_data.txt'  # Replace with your file path
+                data = pd.read_csv(file_path, delim_whitespace=True)
 
+                # Step 2: Extract the t column as X
+                X = data['t'].values.reshape(-1, 1)
+
+                if i == 0:
+                    y = data['x'].values.reshape(-1, 1)
+                else:
+                    y = data['y'].values.reshape(-1, 1)
+            '''
             x_to_fit, x_to_predict, y_to_fit, y_to_predict = train_test_split(
                 X, y, test_size=0.25, shuffle=True, random_state=random_state)
 
@@ -178,7 +271,7 @@ def evaluate_pmlb_lso(
             else:
                 scaled_X = X
                 
-            bag_number =1 
+            bag_number = 1 
             done_bagging = False
             bagging_threshold = 0.99 
             max_r2_zero = 0
@@ -197,21 +290,31 @@ def evaluate_pmlb_lso(
                 sample_to_learn['y_to_predict'] = [y_to_predict]
                 with torch.no_grad():
                     if params.lso_optimizer == "gwo":
-                        batch_results = lso_fit(sample_to_learn, env, params, model,batch_results,bag_number)
-                    else:
-                        opt_LSO = LSOFitNeverGrad( env, params, model, sample_to_learn, batch_results, bag_number)
+                        batch_results = lso_fit(sample_to_learn, env, params, model,batch_results,bag_number, feature_names, true_model)
+                    elif params.lso_optimizer == "bo":
+                        opt_LSO = LSOFitBoTorch( env, params, model, sample_to_learn, batch_results, bag_number, logger)
                         batch_results = opt_LSO.fit_func()
-                    
+                    else:
+                        opt_LSO = LSOFitNeverGrad( env, params, model, sample_to_learn, batch_results, bag_number, logger)
+                        batch_results = opt_LSO.fit_func()
+                
+                batch_results["dataset"].extend([problem_name])
+                batch_results["algorithm"].extend(["ITIP"])
+                batch_results["random_state"].extend([random_state])
+                batch_results["friedman_dataset"].extend(['_fri_' in problem_name])
+                batch_results["symbolic_alg"].extend([True])
+                batch_results["target_noise"].extend([target_noise])
+                batch_results["feature_noise"].extend([feature_noise])
+                batch_results["true_model"].extend([str(true_model)])
+                batch_results["data_group"].extend([data_type.capitalize()])
+
                 batch_results = pd.DataFrame.from_dict(batch_results)
-                batch_results.insert(0, "problem", problem_name)
-                batch_results.insert(0, "formula", formula)
-                batch_results["input_dimension"] = x_to_fit.shape[1]
-                batch_results["bag_number"] = bag_number
+
                 '''
                 if batch_results["r2_zero_final_fit"][0] > max_r2_zero:
                     final_results = batch_results.copy()
-                    batch_results["r2_zero_final_fit"][0] = np.nan
                     max_r2_zero = batch_results["r2_zero_final_fit"][0]
+
                 print("R2 zero final fit: ", batch_results["r2_zero_final_fit"][0])
                 '''
                 final_results = batch_results.copy()
@@ -464,7 +567,7 @@ def evaluate_lso_in_domain(
 
 
 if __name__ == '__main__':
-    os.environ["CUDA_VISIBLE_DEVICES"]="6"
+    os.environ["CUDA_VISIBLE_DEVICES"]="3"
     
     #load data:
     parser = get_parser()
@@ -493,7 +596,7 @@ if __name__ == '__main__':
     params.num_workers = 1
     # params.target_noise = 0.0
     # params.max_input_points = 200
-    params.random_state = 14423
+    params.random_state = 999
     params.max_number_bags = 10
     # params.save_results = True
     params.eval_verbose_print = True
@@ -501,9 +604,9 @@ if __name__ == '__main__':
     # params.pmlb_data_type =  "strogatz" # #"blackbox" #"feynman" # # 
     params.n_trees_to_refine = params.beam_size
 
-    np.random.seed(params.seed)
-    torch.manual_seed(params.seed)
-    torch.cuda.manual_seed(params.seed)
+    #np.random.seed(params.seed)
+    #torch.manual_seed(params.seed)
+    #torch.cuda.manual_seed(params.seed)
     
     # CPU / CUDA
     if not params.cpu:
@@ -518,34 +621,62 @@ if __name__ == '__main__':
     trainer = Trainer(modules, env, params)
   
     if params.eval_lso_on_pmlb:
+        logger = initialize_exp(params)
+
         target_noise = params.target_noise
         random_state = params.random_state
-        data_type = params.pmlb_data_type
         save = params.save_results
 
-        if data_type == "feynman":
-            filter_fn = lambda x: x["dataset"].str.contains("feynman")
-        elif data_type == "strogatz":
-            print("Strogatz data")
-            filter_fn = lambda x: x["dataset"].str.contains("strogatz")
-        else:
-            filter_fn = lambda x: ~(
-                x["dataset"].str.contains("strogatz")
-                | x["dataset"].str.contains("feynman"))
+        dataset_types = ["strogatz"]
 
-        evaluate_pmlb_lso(
-            trainer,
-            params,
-            target_noise=target_noise,
-            verbose=params.eval_verbose_print,
-            random_state=random_state,
-            save=save,
-            filter_fn=filter_fn,
-            save_file=None,
-            save_suffix="./eval_result/noise/eval_{}_optimizer_{}_popsize_{}_maxiter_{}_stopr2_{}_noise_{}.csv".format(params.pmlb_data_type,
-                                                                                                                        params.lso_optimizer,
-                                                                                                                        params.lso_pop_size,
-                                                                                                                        params.lso_max_iteration,
-                                                                                                                        params.lso_stop_r2,
-                                                                                                                        params.target_noise),
-        )
+        pattern = r'/([^/]+)/[^/]+/[^/]+$'
+        match = re.search(pattern, params.dump_path)
+        weights_string = match.group(1) if match else "default"
+        print("Extracted string:", weights_string)
+
+        first_write = True
+
+        start_from_index = 5
+        for data_type in dataset_types:
+            print(f"Evaluating {data_type} datasets")
+
+            if data_type == "feynman":
+                filter_fn = lambda x: x["dataset"].str.contains("feynman")
+            elif data_type == "strogatz":
+                print("Strogatz data")
+                filter_fn = lambda x: x["dataset"].str.contains("strogatz")
+
+            # Loop over 10 random states
+            for i in range(10):
+                current_random_state = ((i * 9) + 9) * 268 
+                print(f"Running evaluation with random state: {current_random_state}")
+
+                # Update the random state in params
+                params.random_state = current_random_state
+
+                # Evaluate the model
+                evaluate_pmlb_lso(
+                    data_type,
+                    trainer,
+                    params,
+                    target_noise=target_noise,
+                    verbose=params.eval_verbose_print,
+                    random_state=current_random_state,
+                    save=save,
+                    logger=logger,
+                    filter_fn=filter_fn,
+                    save_file=None,
+                    save_suffix="./eval_result/noise/eval_{}_optimizer_{}_popsize_{}_maxiter_{}_stopr2_{}_noise_{}.csv".format(
+                        weights_string,
+                        params.lso_optimizer,
+                        params.lso_pop_size,
+                        params.lso_max_iteration,
+                        params.lso_stop_r2,
+                        params.target_noise
+                    ),
+                    first_write=first_write,
+                    start_from_index = start_from_index
+                )
+
+                start_from_index = 0
+                first_write = False

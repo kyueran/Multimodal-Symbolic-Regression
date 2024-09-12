@@ -1,0 +1,67 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "2"
+            },
+            "args": [
+                "--reload_model", "./weights/snip-e2e-sr.pth",
+                "--dump_path", "./dump/eval/snip-e2e-sr",
+                "--eval_lso_on_pmlb", "True",
+                "--pmlb_data_type", "gt",
+                "--target_noise", "0.0",
+                "--max_input_points", "200",
+                "--lso_optimizer", "gwo",
+                "--lso_pop_size", "50",
+                "--lso_max_iteration", "20",
+                "--lso_stop_r2", "0.99",
+                "--beam_size", "2",
+                "--exp_id", "test",
+            ]
+        }
+    ]
+}
+
+/*
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "args": [
+                "--reload_model_snipenc", "./weights/image-text-o2-periodic-4.pth",
+                "--reload_model_e2edec", "./weights/model1.pt",
+                "--freeze_encoder", "True",
+                "--batch_size", "64",
+                "--dump_path", "./dump", 
+                "--max_input_dimension", "6", 
+                "--max_output_dimension", "2", 
+                "--n_steps_per_epoch", "1000", 
+                "--max_epoch", "100000", 
+                "--exp_name", "snipe2e", 
+                "--exp_id", "image-text-o2-p4", 
+                "--lr", "4e-5", 
+                "--latent_dim", "512", 
+                "--save_periodic", "1", 
+                "--n_dec_layers", "16",
+            ]
+        }
+    ]
+}
+*/
